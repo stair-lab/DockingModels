@@ -1,0 +1,20 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "Docking Models"
+version = "0.0.1"
+authors = [
+  { name="Sang Truong", email="sttruong@cs.stanford.edu" },
+  { name="Tai Dang", email="sttruong@cs.stanford.edu" },
+]
+description = "A small package providing a function for embedding extraction for protein"
+readme = "README.md"
+requires-python = ">=3.8"
+
+[project.urls]
+Homepage = "https://github.com/stair-lab/DockingModels"
+
+[tool.hatch.build.targets.wheel]
+      packages = ["src/DockingModels"]
