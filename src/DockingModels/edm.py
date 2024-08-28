@@ -2,7 +2,7 @@ import math
 import torch
 import numpy as np
 from torch import nn
-from DockingModels.registry import register_model
+from DockingModels.registry import register_model, model_entrypoint
 from torch.nn import functional as F
 from torch_cluster import radius, radius_graph
 from torch_scatter import scatter, scatter_mean
@@ -320,6 +320,7 @@ class CustomConfig(PretrainedConfig):
         S_min=0.05,
         S_max=50,
         S_noise=1.003,
+        model_name='en_score_model_l1_4M_drop01',
         **kwargs
     ):
         super().__init__(**kwargs)
@@ -331,6 +332,7 @@ class CustomConfig(PretrainedConfig):
         self.S_min = S_min
         self.S_max = S_max
         self.S_noise = S_noise
+        self.model_name = model_name
 
 
 class EquivariantElucidatedDiffusion(PreTrainedModel):
@@ -339,9 +341,11 @@ class EquivariantElucidatedDiffusion(PreTrainedModel):
     def __init__(
         self,
         config: CustomConfig,
-        net: EGNNModel,
     ):
         super().__init__(config)
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        create_model = model_entrypoint(config.model_name)
+        net = create_model(device=device, lm_embedding_type='esm')
         self.net = net
         self.sigma_min = config.sigma_min
         self.sigma_max = config.sigma_max
