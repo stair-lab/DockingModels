@@ -2,11 +2,12 @@ import math
 import torch
 import numpy as np
 from torch import nn
-from models.registry import register_model
+from DockingModels.registry import register_model, model_entrypoint
 from torch.nn import functional as F
 from torch_cluster import radius, radius_graph
 from torch_scatter import scatter, scatter_mean
-from models.egnn import EGNN, EquivariantBlock
+from DockingModels.egnn import EGNN, EquivariantBlock
+from transformers import PreTrainedModel, PretrainedConfig
 import copy
 
 def remove_mean(x):
@@ -306,22 +307,23 @@ class EGNNModel(nn.Module):
         return edge_index, edge_attr
 
 
-class EquivariantElucidatedDiffusion(torch.nn.Module):
+class CustomConfig(PretrainedConfig):
+    model_type = "equivariant_elucidated_diffusion"
+
     def __init__(
         self,
-        net: EGNNModel,
-        sigma_min = 0.002,     # min noise level
-        sigma_max = 4,        # max noise level
-        sigma_data = 16,      # standard deviation of data distribution
+        sigma_data=32,       # standard deviation of data distribution
+        sigma_min=0.002,     # min noise level
+        sigma_max=160,         # max noise level
         rho=7,
         S_churn=40,
         S_min=0.05,
         S_max=50,
         S_noise=1.003,
+        model_name='en_score_model_l1_4M_drop01',
         **kwargs
     ):
-        super().__init__()
-        self.net = net
+        super().__init__(**kwargs)
         self.sigma_min = sigma_min
         self.sigma_max = sigma_max
         self.sigma_data = sigma_data
@@ -330,8 +332,29 @@ class EquivariantElucidatedDiffusion(torch.nn.Module):
         self.S_min = S_min
         self.S_max = S_max
         self.S_noise = S_noise
-        self.device = net.device
-        self.register_buffer('zero', torch.tensor(0.), persistent = False)
+        self.model_name = model_name
+
+
+class EquivariantElucidatedDiffusion(PreTrainedModel):
+    config_class = CustomConfig
+
+    def __init__(
+        self,
+        config: CustomConfig,
+    ):
+        super().__init__(config)
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        create_model = model_entrypoint(config.model_name)
+        net = create_model(device=device, lm_embedding_type='esm')
+        self.net = net
+        self.sigma_min = config.sigma_min
+        self.sigma_max = config.sigma_max
+        self.sigma_data = config.sigma_data
+        self.rho = config.rho
+        self.S_churn = config.S_churn
+        self.S_min = config.S_min
+        self.S_max = config.S_max
+        self.S_noise = config.S_noise
 
     @torch.no_grad()
     def sample(self, data, num_steps, dtype=torch.float32):
