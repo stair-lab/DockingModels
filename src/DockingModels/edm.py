@@ -1,66 +1,16 @@
+import e3nn
 import math
 import torch
+import einops
 import numpy as np
+from e3nn import o3
 from torch import nn
+from DockingModels.batchnorm import BatchNorm
 from DockingModels.registry import register_model, model_entrypoint
 from torch.nn import functional as F
 from torch_cluster import radius, radius_graph
 from torch_scatter import scatter, scatter_mean
-from DockingModels.egnn import EGNN, EquivariantBlock
 from transformers import PreTrainedModel, PretrainedConfig
-import copy
-
-def remove_mean(x):
-    mean = torch.mean(x, dim=1, keepdim=True)
-    x = x - mean
-    return x
-
-class GELUMLP(nn.Module):
-    """Simple MLP with post-LayerNorm"""
-
-    def __init__(
-        self,
-        n_in_feats,
-        n_out_feats,
-        n_hidden_feats=None,
-        dropout=0.0,
-        zero_init=False,
-    ):
-        super(GELUMLP, self).__init__()
-        self.dropout = dropout
-        if n_hidden_feats is None:
-            self.layers = nn.Sequential(
-                nn.Linear(n_in_feats, n_in_feats),
-                nn.GELU(),
-                nn.LayerNorm(n_in_feats),
-                nn.Linear(n_in_feats, n_out_feats),
-            )
-        else:
-            self.layers = nn.Sequential(
-                nn.Linear(n_in_feats, n_hidden_feats),
-                nn.GELU(),
-                nn.Dropout(p=self.dropout),
-                nn.Linear(n_hidden_feats, n_hidden_feats),
-                nn.GELU(),
-                nn.LayerNorm(n_hidden_feats),
-                nn.Linear(n_hidden_feats, n_out_feats),
-            )
-        nn.init.xavier_uniform_(self.layers[0].weight, gain=1)
-        # zero init for residual branches
-        if zero_init:
-            self.layers[-1].weight.data.fill_(0.0)
-        else:
-            nn.init.xavier_uniform_(self.layers[-1].weight, gain=1)
-
-    def _zero_init(self, module):
-        if isinstance(module, nn.Linear):
-            module.weight.data.zero_()
-            if module.bias is not None:
-                module.bias.data.zero_()
-
-    def forward(self, x: torch.Tensor):
-        x = F.dropout(x, p=self.dropout, training=self.training)
-        return self.layers(x)
 
 class GaussianSmearing(torch.nn.Module):
     # used to embed the edge distances
@@ -138,109 +88,185 @@ class AtomEncoder(nn.Module):
         x_embedding = self.embed(x_embedding)
         return x_embedding
 
-class EGNNModel(nn.Module):
-    def __init__(self, device, in_lig_edge_features=4, sigma_embed_dim=32, in_dim=8,
-                 in_node_nf=16, num_layers=2, lig_max_radius=5, rec_max_radius=30,
-                 cross_max_distance=250, distance_embed_dim=32, cross_distance_embed_dim=32,
-                 batch_norm=True, dropout=0.0, lm_embedding_type=None):
 
-        super(EGNNModel, self).__init__()
+class TensorProductConvLayer(nn.Module):
+    def __init__(self, in_irreps, sh_irreps, out_irreps, n_edge_features, residual=True, batch_norm=True, dropout=0.0,
+                 hidden_features=None):
+        super(TensorProductConvLayer, self).__init__()
+        self.in_irreps = in_irreps
+        self.out_irreps = out_irreps
+        self.sh_irreps = sh_irreps
+        self.residual = residual
+        if hidden_features is None:
+            hidden_features = n_edge_features
+
+        self.tp = tp = o3.FullyConnectedTensorProduct(in_irreps, sh_irreps, out_irreps, shared_weights=False)
+
+        self.fc = nn.Sequential(
+            nn.Linear(n_edge_features, hidden_features),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_features, tp.weight_numel)
+        )
+        self.batch_norm = BatchNorm(out_irreps) if batch_norm else None
+
+    def forward(self, node_attr, edge_index, edge_attr, edge_sh, out_nodes=None, reduce='mean', dtype=torch.float32):
+
+        edge_src, edge_dst = edge_index
+
+        tp = self.tp(node_attr[edge_dst], edge_sh, self.fc(edge_attr))
+
+        out_nodes = out_nodes or node_attr.shape[0]
+        out = scatter(tp, edge_src, dim=0, dim_size=out_nodes, reduce=reduce)
+
+        if self.residual:
+            padded = F.pad(node_attr, (0, out.shape[-1] - node_attr.shape[-1]))
+            out = out + padded
+
+        if self.batch_norm:
+            out = self.batch_norm(out.to(torch.float32))
+            out = out.to(dtype)
+        return out
+
+
+class TensorProductScoreModel(nn.Module):
+    def __init__(self, device, in_lig_edge_features=4, sigma_embed_dim=32, sh_lmax=2,
+                 ns=16, nv=4, num_conv_layers=2, lig_max_radius=5, rec_max_radius=30,
+                 cross_max_distance=250, distance_embed_dim=32, cross_distance_embed_dim=32,
+                 use_second_order_repr=False, batch_norm=True, dropout=0.0, lm_embedding_type=None):
+        super(TensorProductScoreModel, self).__init__()
         self.in_lig_edge_features = in_lig_edge_features
         self.sigma_embed_dim = sigma_embed_dim
         self.lig_max_radius = lig_max_radius
         self.rec_max_radius = rec_max_radius
         self.cross_max_distance = cross_max_distance
-        self.in_node_nf = in_node_nf
+        self.distance_embed_dim = distance_embed_dim
+        self.cross_distance_embed_dim = cross_distance_embed_dim
+        self.sh_irreps = o3.Irreps.spherical_harmonics(lmax=sh_lmax)
+        self.ns, self.nv = ns, nv
         self.device = device
+        self.time_embed = FourierEmbedding(self.sigma_embed_dim)
 
-        self.in_dim = in_dim
+        self.num_conv_layers = num_conv_layers
+        self.lig_node_embedding = AtomEncoder(emb_dim=ns, feature_dims=([119, 4, 12, 12, 8, 10, 6, 6, 2, 8, 2, 2, 2, 2, 2, 2], 0), sigma_embed_dim=sigma_embed_dim)
+        self.lig_edge_embedding = nn.Sequential(nn.Linear(in_lig_edge_features + sigma_embed_dim + distance_embed_dim, ns),nn.ReLU(), nn.Dropout(dropout),nn.Linear(ns, ns))
 
-        self.time_embed = FourierEmbedding(sigma_embed_dim)
-        lig_feature_dims = ([119, 4, 12, 12, 8, 10, 6, 6, 2, 8, 2, 2, 2, 2, 2, 2], 0)
-        rec_residue_feature_dims = ([38], 0)
+        self.rec_node_embedding = AtomEncoder(emb_dim=ns, feature_dims=([38], 0), sigma_embed_dim=sigma_embed_dim, lm_embedding_type=lm_embedding_type)
+        self.rec_edge_embedding = nn.Sequential(nn.Linear(sigma_embed_dim + distance_embed_dim, ns), nn.ReLU(), nn.Dropout(dropout),nn.Linear(ns, ns))
 
-        self.num_layers = num_layers
-        self.lig_node_embedding = AtomEncoder(emb_dim=in_dim, feature_dims=lig_feature_dims, sigma_embed_dim=sigma_embed_dim, h_dim=in_node_nf)
-        self.lig_edge_embedding = nn.Sequential(nn.Linear(in_lig_edge_features + sigma_embed_dim + distance_embed_dim, in_node_nf),nn.ReLU(), nn.Dropout(dropout),nn.Linear(in_node_nf, in_node_nf))
-
-        self.rec_node_embedding = AtomEncoder(emb_dim=in_dim, feature_dims=rec_residue_feature_dims, sigma_embed_dim=sigma_embed_dim, lm_embedding_type=lm_embedding_type, h_dim=in_node_nf)
-        self.rec_edge_embedding = nn.Sequential(nn.Linear(sigma_embed_dim + distance_embed_dim, in_node_nf), nn.ReLU(), nn.Dropout(dropout),nn.Linear(in_node_nf, in_node_nf))
-
-        self.cross_edge_embedding = nn.Sequential(nn.Linear(sigma_embed_dim + cross_distance_embed_dim, in_node_nf), nn.ReLU(), nn.Dropout(dropout),nn.Linear(in_node_nf, in_node_nf))
+        self.cross_edge_embedding = nn.Sequential(nn.Linear(sigma_embed_dim + cross_distance_embed_dim, ns), nn.ReLU(), nn.Dropout(dropout),nn.Linear(ns, ns))
         self.lig_distance_expansion = GaussianSmearing(0.0, lig_max_radius, distance_embed_dim)
         self.rec_distance_expansion = GaussianSmearing(0.0, rec_max_radius, distance_embed_dim)
         self.cross_distance_expansion = GaussianSmearing(0.0, cross_max_distance, cross_distance_embed_dim)
 
-        self.emb_layers = 3
-        for i in range(self.emb_layers):
+
+        if use_second_order_repr:
+            irrep_seq = [
+                f'{ns}x0e',
+                f'{ns}x0e + {nv}x1o + {nv}x2e',
+                f'{ns}x0e + {nv}x1o + {nv}x2e + {nv}x1e + {nv}x2o',
+                f'{ns}x0e + {nv}x1o + {nv}x2e + {nv}x1e + {nv}x2o + {ns}x0o'
+            ]
+        else:
+            irrep_seq = [
+                f'{ns}x0e',
+                f'{ns}x0e + {nv}x1o',
+                f'{ns}x0e + {nv}x1o + {nv}x1e',
+                f'{ns}x0e + {nv}x1o + {nv}x1e + {ns}x0o'
+            ]
+
+        self.lig_conv_layers, self.rec_conv_layers, self.lig_to_rec_conv_layers, self.rec_to_lig_conv_layers = \
+        nn.ModuleList(), nn.ModuleList(), nn.ModuleList(), nn.ModuleList()
+
+        for i in range(num_conv_layers):
+            in_irreps = irrep_seq[min(i, len(irrep_seq) - 1)]
+            out_irreps = irrep_seq[min(i + 1, len(irrep_seq) - 1)]
             parameters = {
-                'hidden_nf': in_node_nf,
-                'edge_feat_nf': 1 + in_node_nf*3,
-                'device': device,
-                'tanh': False,
-                'n_layers': 2,
-
+                'in_irreps': in_irreps,
+                'sh_irreps': self.sh_irreps,
+                'out_irreps': out_irreps,
+                'n_edge_features': 3 * ns,
+                'hidden_features': 3 * ns,
+                'residual': False,
+                'batch_norm': batch_norm,
+                'dropout': dropout
             }
-            self.add_module("lig_e_block_%d" % i, EquivariantBlock(**parameters, normalization_factor=1000))
-            self.add_module("rec_e_block_%d" % i, EquivariantBlock(**parameters, normalization_factor=9000))
 
-        for i in range(num_layers):
-            parameters = {
-                'hidden_nf': in_node_nf,
-                'edge_feat_nf': 1 + in_node_nf*3,
-                'device': device,
-                'tanh': False,
-                'n_layers': 2,
+            lig_layer = TensorProductConvLayer(**parameters)
+            self.lig_conv_layers.append(lig_layer)
 
-            }
-            self.add_module("e_block_%d" % i, EquivariantBlock(**parameters, normalization_factor=10000))
+            rec_to_lig_layer = TensorProductConvLayer(**parameters)
+            self.rec_to_lig_conv_layers.append(rec_to_lig_layer)
 
-        self.linear = GELUMLP(3,3,32)
+            if i != num_conv_layers - 1:
+              rec_layer = TensorProductConvLayer(**parameters)
+              self.rec_conv_layers.append(rec_layer)
+              lig_to_rec_layer = TensorProductConvLayer(**parameters)
+              self.lig_to_rec_conv_layers.append(lig_to_rec_layer)
 
+        self.last_conv = TensorProductConvLayer(
+            in_irreps=self.lig_conv_layers[-1].out_irreps,
+            sh_irreps=self.sh_irreps,
+            out_irreps=f'1x1o',
+            n_edge_features=3 * ns,
+            residual=False,
+            dropout=dropout,
+            batch_norm=batch_norm
+        )
 
     def forward(self, data, times, dtype):
 
         # build ligand graph
-        lig_node_attr, lig_edge_index, lig_edge_attr = self.build_lig_conv_graph(data, times)
+        lig_node_attr, lig_edge_index, lig_edge_attr, lig_edge_sh = self.build_lig_conv_graph(data, times)
         lig_src, lig_dst = lig_edge_index
         lig_node_attr = self.lig_node_embedding(lig_node_attr, dtype=dtype)
         lig_edge_attr = self.lig_edge_embedding(lig_edge_attr)
-        lig_coords = data['ligand'].pos.clone()
 
         # build receptor graph
-        rec_node_attr, rec_edge_index, rec_edge_attr = self.build_rec_conv_graph(data, times)
+        rec_node_attr, rec_edge_index, rec_edge_attr, rec_edge_sh = self.build_rec_conv_graph(data, times)
         rec_src, rec_dst = rec_edge_index
         rec_node_attr = self.rec_node_embedding(rec_node_attr, dtype=dtype)
         rec_edge_attr = self.rec_edge_embedding(rec_edge_attr)
-        rec_coords = data['receptor'].pos.clone()
-
-        for l in range(self.emb_layers):
-            lig_edge_attr_ = torch.cat([lig_edge_attr, lig_node_attr[lig_edge_index[0], :self.in_node_nf], lig_node_attr[lig_edge_index[1], :self.in_node_nf]], -1)
-            rec_edge_attr_ = torch.cat([rec_edge_attr, rec_node_attr[rec_edge_index[0], :self.in_node_nf], rec_node_attr[rec_edge_index[1], :self.in_node_nf]], -1)
-
-            lig_node_attr, lig_coords = self._modules["lig_e_block_%d" % l](lig_node_attr, lig_coords, lig_edge_index, edge_attr=lig_edge_attr_, dtype=dtype)
-            rec_node_attr, rec_coords = self._modules["rec_e_block_%d" % l](rec_node_attr, rec_coords, rec_edge_index, edge_attr=rec_edge_attr_, dtype=dtype)
 
         # build cross graph
-        cross_edge_index, cross_edge_attr = self.build_cross_conv_graph(data, self.cross_max_distance)
+        #cross_cutoff = (data.sigma + 5 * 3).unsqueeze(1)
+        cross_cutoff = data.sigma * 3 + 20
+        cross_edge_index, cross_edge_attr, cross_edge_sh = self.build_cross_conv_graph(data, cross_cutoff)
         cross_lig, cross_rec = cross_edge_index
         cross_edge_attr = self.cross_edge_embedding(cross_edge_attr)
 
-        coords = torch.cat([lig_coords, rec_coords], dim=0)
-        node_attr = torch.cat([lig_node_attr, rec_node_attr], dim=0)
-        cross_edge_index[1] = cross_edge_index[1] + len(lig_node_attr)
-        edge_index = torch.cat([lig_edge_index, cross_edge_index, rec_edge_index + len(lig_node_attr),
-                                torch.flip(cross_edge_index, dims=[0])], dim=1)
-        edge_attr = torch.cat([lig_edge_attr, cross_edge_attr, rec_edge_attr, cross_edge_attr], dim=0)
+        for l in range(len(self.lig_conv_layers)):
+            # intra graph message passing
+            lig_edge_attr_ = torch.cat([lig_edge_attr, lig_node_attr[lig_src, :self.ns], lig_node_attr[lig_dst, :self.ns]], -1)
 
-        for i in range(self.num_layers):
-            edge_attr_ = torch.cat([edge_attr, node_attr[edge_index[0], :self.in_node_nf], node_attr[edge_index[1], :self.in_node_nf]], -1)
-            node_attr, coords = self._modules["e_block_%d" % i](node_attr, coords, edge_index, edge_attr=edge_attr_, dtype=dtype)
+            lig_intra_update = self.lig_conv_layers[l](lig_node_attr, lig_edge_index, lig_edge_attr_, lig_edge_sh, dtype=dtype)
+            # inter graph message passing
+            rec_to_lig_edge_attr_ = torch.cat([cross_edge_attr, lig_node_attr[cross_lig, :self.ns], rec_node_attr[cross_rec, :self.ns]], -1)
+            lig_inter_update = self.rec_to_lig_conv_layers[l](rec_node_attr, cross_edge_index, rec_to_lig_edge_attr_, cross_edge_sh,
+                                                              out_nodes=lig_node_attr.shape[0], dtype=dtype)
 
-        lig_coords = coords[:len(lig_coords)]
-        vel = lig_coords
-        vel = self.linear(vel)
-        return vel
+            if l != len(self.lig_conv_layers) - 1:
+                rec_edge_attr_ = torch.cat([rec_edge_attr, rec_node_attr[rec_src, :self.ns], rec_node_attr[rec_dst, :self.ns]], -1)
+                rec_intra_update = self.rec_conv_layers[l](rec_node_attr, rec_edge_index, rec_edge_attr_, rec_edge_sh, dtype=dtype)
+
+                lig_to_rec_edge_attr_ = torch.cat([cross_edge_attr, lig_node_attr[cross_lig, :self.ns], rec_node_attr[cross_rec, :self.ns]], -1)
+
+                rec_inter_update = self.lig_to_rec_conv_layers[l](lig_node_attr, torch.flip(cross_edge_index, dims=[0]), lig_to_rec_edge_attr_,
+                                                                  cross_edge_sh, out_nodes=rec_node_attr.shape[0], dtype=dtype)
+
+            # padding original features
+            lig_node_attr = F.pad(lig_node_attr, (0, lig_intra_update.shape[-1] - lig_node_attr.shape[-1]))
+
+            # update features with residual updates
+            lig_node_attr = lig_node_attr + lig_intra_update + lig_inter_update
+
+            if l != len(self.lig_conv_layers) - 1:
+                rec_node_attr = F.pad(rec_node_attr, (0, rec_intra_update.shape[-1] - rec_node_attr.shape[-1]))
+                rec_node_attr = rec_node_attr + rec_intra_update + rec_inter_update
+
+        lig_edge_attr_ = torch.cat([lig_edge_attr, lig_node_attr[lig_src, :self.ns], lig_node_attr[lig_dst, :self.ns]], -1)
+        pos_pred = self.last_conv(lig_node_attr, lig_edge_index, lig_edge_attr_, lig_edge_sh, dtype=dtype)
+        return pos_pred, lig_node_attr, rec_node_attr
 
     def build_lig_conv_graph(self, data, times):
         # builds the ligand graph edges and initial node and edge features
@@ -256,15 +282,16 @@ class EGNNModel(nn.Module):
 
         # compute initial features
         edge_sigma_emb = data['ligand'].node_sigma_emb[edge_index[0].long()]
-
+        edge_attr = torch.cat([edge_attr, edge_sigma_emb], 1)
         node_attr = torch.cat([data['ligand'].pos, data['ligand'].x, data['ligand'].node_sigma_emb], 1)
-
         src, dst = edge_index
         edge_vec = data['ligand'].pos[dst.long()] - data['ligand'].pos[src.long()]
         edge_length_emb = self.lig_distance_expansion(edge_vec.norm(dim=-1))
-        edge_attr = torch.cat([edge_attr, edge_sigma_emb, edge_length_emb], 1)
 
-        return node_attr, edge_index, edge_attr
+        edge_attr = torch.cat([edge_attr, edge_length_emb], 1)
+
+        edge_sh = o3.spherical_harmonics(self.sh_irreps, edge_vec, normalize=True, normalization='component')
+        return node_attr, edge_index, edge_attr, edge_sh
 
     def build_rec_conv_graph(self, data, times):
         # builds the receptor initial node and edge embeddings
@@ -283,8 +310,10 @@ class EGNNModel(nn.Module):
         edge_length_emb = self.rec_distance_expansion(edge_vec.norm(dim=-1))
         edge_sigma_emb = data['receptor'].node_sigma_emb[edge_index[0].long()]
         edge_attr = torch.cat([edge_sigma_emb, edge_length_emb], 1)
+        edge_sh = o3.spherical_harmonics(self.sh_irreps, edge_vec, normalize=True, normalization='component')
 
-        return node_attr, edge_index, edge_attr
+        return node_attr, edge_index, edge_attr, edge_sh
+
 
     def build_cross_conv_graph(self, data, cross_distance_cutoff):
         # builds the cross edges between ligand and receptor
@@ -303,8 +332,9 @@ class EGNNModel(nn.Module):
         edge_length_emb = self.cross_distance_expansion(edge_vec.norm(dim=-1))
         edge_sigma_emb = data['ligand'].node_sigma_emb[src.long()]
         edge_attr = torch.cat([edge_sigma_emb, edge_length_emb], 1)
+        edge_sh = o3.spherical_harmonics(self.sh_irreps, edge_vec, normalize=True, normalization='component')
 
-        return edge_index, edge_attr
+        return edge_index, edge_attr, edge_sh
 
 
 class CustomConfig(PretrainedConfig):
@@ -320,7 +350,8 @@ class CustomConfig(PretrainedConfig):
         S_min=0.05,
         S_max=50,
         S_noise=1.003,
-        model_name='en_score_model_l1_4M_drop01',
+        eta=1.5,
+        model_name='e3_score_model_l1_4M_drop00',
         **kwargs
     ):
         super().__init__(**kwargs)
@@ -332,6 +363,7 @@ class CustomConfig(PretrainedConfig):
         self.S_min = S_min
         self.S_max = S_max
         self.S_noise = S_noise
+        self.eta = eta
         self.model_name = model_name
 
 
@@ -355,19 +387,17 @@ class EquivariantElucidatedDiffusion(PreTrainedModel):
         self.S_min = config.S_min
         self.S_max = config.S_max
         self.S_noise = config.S_noise
+        self.eta = config.eta
 
     @torch.no_grad()
     def sample(self, data, num_steps, dtype=torch.float32):
-        x_latents = []
         batch = data['ligand'].batch
-        batch_size = torch.unique(batch).shape[0]
-        step_indices = torch.arange(num_steps, device=self.device)
+        batch_size = torch.unique(batch)
+        step_indices = torch.arange(num_steps, device=batch.device)
         t_steps = self.sigma_data * ((self.sigma_max ** (1 / self.rho) + step_indices / (num_steps - 1) * (self.sigma_min ** (1 / self.rho) - self.sigma_max ** (1 / self.rho))) ** self.rho)
         t_steps = torch.cat([torch.as_tensor(t_steps), torch.zeros_like(t_steps[:1])]) # t_N = 0
 
-        data.atom_pos_ground_truth = copy.deepcopy(data['ligand'].pos)
-        x_next = t_steps[0] * torch.randn_like(data['ligand'].pos, device = self.device)
-        x_latents.append(x_next)
+        x_next = t_steps[0] * torch.randn_like(data['ligand'].pos, device = batch.device)
 
         for i, (t_cur, t_next) in enumerate(zip(t_steps[:-1], t_steps[1:])):
             x_cur = x_next
@@ -376,28 +406,19 @@ class EquivariantElucidatedDiffusion(PreTrainedModel):
             x_hat = x_cur + (t_hat ** 2 - t_cur ** 2).sqrt() * self.S_noise * torch.randn_like(x_cur)
 
             # Euler step.
-            data.padded_sigmas = torch.tensor([t_hat]).reshape(-1,1).repeat(batch_size, 1).to(self.device)
+            data.padded_sigmas = torch.tensor([t_hat]).reshape(-1,1).repeat(len(batch_size), 1).to(batch.device)
+            data.sigma = data.padded_sigmas / self.sigma_data
 
             c_in = 1 / (self.sigma_data ** 2 + data.padded_sigmas ** 2).sqrt()
             data['ligand'].pos = c_in[batch] * copy.deepcopy(x_hat)
             data.noised_atom_pos = copy.deepcopy(x_hat)
             with torch.no_grad(), torch.autocast(device_type='cuda', dtype=dtype):
-                denoised = self(data, dtype)
+                denoised, rec_node_attr, lig_node_attr = self(data, dtype)
 
             d_cur = (x_hat - denoised) / t_hat
-            x_next = x_hat + (t_next - t_hat) * d_cur
+            x_next = x_hat + (t_next - t_hat) * d_cur * self.eta
 
-            # Apply 2nd order correction.
-            if i < num_steps - 1:
-                data['ligand'].pos = c_in[batch] * copy.deepcopy(x_next)
-                data.noised_atom_pos = copy.deepcopy(x_next)
-                with torch.no_grad(), torch.autocast(device_type='cuda', dtype=dtype):
-                    denoised = self(data, dtype)
-                d_prime = (x_next - denoised) / t_next
-                x_next = x_hat + (t_next - t_hat) * (0.5 * d_cur + 0.5 * d_prime)
-            x_latents.append(x_next)
-
-        return x_latents, x_next
+        return x_next, rec_node_attr, lig_node_attr
 
     def forward(self, data, dtype=torch.float32):
 
@@ -411,35 +432,43 @@ class EquivariantElucidatedDiffusion(PreTrainedModel):
 
         data['ligand'].pos = c_in * x
 
-        F_x = self.net(data, c_noise, dtype)
+        F_x, lig_node_attr, rec_node_attr = self.net(data, c_noise, dtype)
 
         D_x = c_skip * x +  c_out * F_x
 
-        return D_x
+        return D_x, lig_node_attr, rec_node_attr
 
 @register_model
-def en_score_model_l1_4M_drop01(device, lm_embedding_type, **kwargs):
-    model = EGNNModel(
+def e3_score_model_l1_4M_drop01(device, lm_embedding_type, **kwargs):
+    model = TensorProductScoreModel(
         device=device, in_lig_edge_features=4,
-        sigma_embed_dim=32, in_node_nf=128, in_dim=32,
-        num_layers=6, lig_max_radius=5,
-        rec_max_radius=30, cross_max_distance=250,
+        sigma_embed_dim=32, sh_lmax=2, ns=32,
+        nv=8, num_conv_layers=5, lig_max_radius=5,
+        rec_max_radius=30, cross_max_distance=80,
         distance_embed_dim=32,  cross_distance_embed_dim=32,
-        batch_norm=True,
+        use_second_order_repr=False,  batch_norm=True,
         dropout=0.1, lm_embedding_type=lm_embedding_type)
 
     return model
-
 
 @register_model
-def en_score_model_l1_21M_drop01(device, lm_embedding_type, **kwargs):
-    model = EGNNModel(
+def e3_score_model_l1_4M_drop00(device, lm_embedding_type, **kwargs):
+    model = TensorProductScoreModel(
         device=device, in_lig_edge_features=4,
-        sigma_embed_dim=64, in_node_nf=256, in_dim=64,
-        num_layers=7, lig_max_radius=5,
-        rec_max_radius=30, cross_max_distance=250,
-        distance_embed_dim=64,  cross_distance_embed_dim=64,
-        batch_norm=True,
-        dropout=0.1, lm_embedding_type=lm_embedding_type)
+        sigma_embed_dim=32, sh_lmax=2, ns=32,
+        nv=8, num_conv_layers=5, lig_max_radius=5,
+        rec_max_radius=30, cross_max_distance=80,
+        distance_embed_dim=32,  cross_distance_embed_dim=32,
+        use_second_order_repr=False,  batch_norm=True,
+        dropout=0.0, lm_embedding_type=lm_embedding_type)
 
     return model
+
+
+config = CustomConfig()
+model = EquivariantElucidatedDiffusion(config)
+state_dict = torch.load('/content/model_30000.pth')
+model.load_state_dict(state_dict, strict=True)
+model.eval()
+model.save_pretrained('/content/docking_model/ckpts')
+print(model)
