@@ -463,12 +463,3 @@ def e3_score_model_l1_4M_drop00(device, lm_embedding_type, **kwargs):
         dropout=0.0, lm_embedding_type=lm_embedding_type)
 
     return model
-
-
-config = CustomConfig()
-model = EquivariantElucidatedDiffusion(config)
-state_dict = torch.load('/content/model_30000.pth')
-model.load_state_dict(state_dict, strict=True)
-model.eval()
-model.save_pretrained('/content/docking_model/ckpts')
-print(model)
