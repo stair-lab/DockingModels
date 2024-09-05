@@ -7,5 +7,5 @@ Secondly, if you want to modify the sampling parameters, you can change them thr
 from DockingModels import EquivariantElucidatedDiffusion, CustomConfig
 
 config = CustomConfig()
-model = EquivariantElucidatedDiffusion.from_pretrained('stair-lab/docking_model', subfolder="ckpts")
+model = EquivariantElucidatedDiffusion.from_pretrained('stair-lab/docking_model')
 ```
