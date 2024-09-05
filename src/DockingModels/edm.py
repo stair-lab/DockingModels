@@ -436,7 +436,7 @@ class EquivariantElucidatedDiffusion(PreTrainedModel):
 
         D_x = c_skip * x +  c_out * F_x
 
-        return D_x, lig_node_attr, rec_node_attr
+        return D_x, rec_node_attr, lig_node_attr
 
 @register_model
 def e3_score_model_l1_4M_drop01(device, lm_embedding_type, **kwargs):
