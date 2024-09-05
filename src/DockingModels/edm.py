@@ -1,4 +1,5 @@
 import e3nn
+import copy
 import math
 import torch
 import einops
